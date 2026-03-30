@@ -181,13 +181,16 @@ class PadelReframer:
 
         BALL_WEIGHT_BASE = 2.5
         PLAYER_WEIGHT    = 1.0
-        CENTER_BIAS      = 0.20
+        # Center bias: always pull toward W/2 (the net / court center line).
+        # This is the camera's home — it rests here and returns here after action.
+        HOME             = float(W / 2)
+        CENTER_BIAS      = 0.25         # 25% pull toward HOME every frame
 
-        SPRING_RALLY   = 0.13
-        SPRING_IDLE    = 0.05
-        SPRING_SPRINT  = 0.28       # only used for genuine fast pans
+        SPRING_RALLY   = 0.14
+        SPRING_IDLE    = 0.09           # stronger return to HOME between points
+        SPRING_SPRINT  = 0.32           # genuine big transitions
         DAMPING        = 0.80
-        MAX_STEP_FRAC  = 0.07
+        MAX_STEP_FRAC  = 0.09           # allow bigger per-frame steps for big pans
 
         REVERSAL_DECAY    = 0.92
         REVERSAL_PENALISE = 3.0
@@ -210,16 +213,18 @@ class PadelReframer:
         LOFT_Y_TRANS   = 0.28
 
         STABLE_PLAYER_ALPHA = 0.06
-        PLAYER_MARGIN       = 25
+        # Player margin: just enough to keep players barely visible.
+        # NOT used to restrict ball-following — camera follows ball freely.
+        PLAYER_MARGIN       = 10
 
         # Path planning: smoothing sigmas (in frames)
-        SIGMA_RALLY    = fps * 0.30   # 0.3 s — keeps responsiveness during rallies
-        SIGMA_IDLE     = fps * 1.20   # 1.2 s — very stable between points
+        SIGMA_RALLY    = fps * 0.18   # 0.18 s — responsive; allows big fast pans
+        SIGMA_IDLE     = fps * 1.50   # 1.5 s — rock-solid between points
         # Future blend: mix current raw target with weighted average of next N frames
-        FUTURE_FRAMES  = int(fps * 0.45)   # 0.45 s look-ahead
-        FUTURE_DECAY   = 0.88              # weight of each successive future frame
-        # A transition is "genuine" if the planned path moves this much in 0.3 s
-        FAST_PAN_THRESH = crop_w * 0.18
+        FUTURE_FRAMES  = int(fps * 0.40)
+        FUTURE_DECAY   = 0.88
+        # A transition is "genuine" if planned path moves this much in 0.3 s
+        FAST_PAN_THRESH = crop_w * 0.14   # lower threshold — detect more transitions
 
         start_time = time.time()
 
@@ -339,24 +344,27 @@ class PadelReframer:
             game_states.append(gs)
 
         # ── B. Compute raw targets ─────────────────────────────────
+        # HOME = W/2 = court center line (the net). Camera lives here and
+        # always wants to return. Action pulls it away; nothing keeps it there.
         raw_targets = np.zeros(N)
         for f in range(N):
             bx, by, bvx, _, blf = ball_states[f]
             pxs = all_dets[f]['player_xs']
-            pl, pr = player_bounds[f]
-            gs = game_states[f]
-            player_midpoint = (pl + pr) / 2.0
-            player_span     = pr - pl
-            slack = max(0.0, crop_w - player_span - 2 * PLAYER_MARGIN)
+            gs  = game_states[f]
 
             if gs == "IDLE":
-                raw = player_midpoint
+                # No ball — return to court center
+                raw = HOME
             elif gs == "LOFT":
-                raw = player_midpoint * 0.90 + bx * 0.10
+                # Ball in arc — hold near center, tiny hint of ball X
+                raw = HOME * 0.90 + bx * 0.10
             elif gs == "RECOVERY":
+                # Ball just lost — fade from last known position back to HOME
                 fade = 1.0 - (blf / BALL_LOST_MAX)
-                raw = bx * fade + player_midpoint * (1.0 - fade)
+                raw = bx * fade + HOME * (1.0 - fade)
             else:  # RALLY
+                # Follow the ball freely — no slack clamp.
+                # Ball pulls camera away from HOME proportional to its weight vs players.
                 speed_abs = abs(bvx)
                 lookahead = LOOKAHEAD_MIN + (LOOKAHEAD_MAX - LOOKAHEAD_MIN) * min(1.0, speed_abs / SPEED_FAST)
                 pred_x = float(np.clip(bx + bvx * lookahead, 0, W))
@@ -369,12 +377,13 @@ class PadelReframer:
                 else:
                     eff_w = BALL_WEIGHT_BASE
 
-                n_players  = max(1, len(pxs))
-                ball_shift = (pred_x - player_midpoint) * (eff_w / (eff_w + PLAYER_WEIGHT * n_players))
-                ball_shift = float(np.clip(ball_shift, -slack / 2, slack / 2))
-                raw = player_midpoint + ball_shift
+                # Weighted average of predicted ball + players (no slack restriction)
+                pts = [pred_x] + list(pxs)
+                wts = [eff_w]  + [PLAYER_WEIGHT] * len(pxs)
+                raw = float(np.average(pts, weights=wts)) if pts else HOME
 
-            raw = raw * (1.0 - CENTER_BIAS) + player_midpoint * CENTER_BIAS
+            # Always blend toward HOME — this is what brings the camera back to center
+            raw = raw * (1.0 - CENTER_BIAS) + HOME * CENTER_BIAS
             raw_targets[f] = raw
 
         # ── C. Future-blend — mix raw target with near-future knowledge ──
