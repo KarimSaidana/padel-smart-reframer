@@ -117,16 +117,17 @@ class PadelReframer:
 
     def reframe(self, input_path, output_path, progress_callback=None):
         """
-        Gravity Core reframing.
-        
-        All detected objects (ball + up to 4 players) form a single
-        weighted cluster. The camera targets the center of mass of 
-        this cluster, where:
-          - Ball weight: 2.5x (it's where the eyes go)
-          - Each player weight: 1.0x (equal anchors, no area bias)
-        
-        When the ball is missing, players alone define the core.
-        The camera always shows the maximum amount of the action.
+        Broadcast-style reframing with game-state awareness.
+
+        Four game states drive all camera decisions:
+          RALLY    — ball detected and moving  → predictive tracking, ball leads camera
+          LOFT     — ball going upward fast    → hold on players, ignore arc position
+          RECOVERY — ball just disappeared     → physics prediction fades into players
+          IDLE     — no ball for a while       → stable wide shot on players
+
+        Camera movement uses a spring-damper model (position + velocity) so it
+        naturally accelerates into a pan and decelerates smoothly into the target,
+        with no snapping or exponential-smoothing artifacts.
         """
         if self.model is None:
             log.error("No YOLO model available")
@@ -153,40 +154,74 @@ class PadelReframer:
         log.info("Input: %dx%d @ %.1ffps, %d frames", W, H, fps, total_frames)
         log.info("Crop: %dx%d", crop_w, H)
 
-        # ── Weights ──
-        BALL_WEIGHT_BASE = 2.5  # ball pulls camera 2.5x more than one player (when mid-frame)
-        PLAYER_WEIGHT    = 1.0  # all players pull equally (no area bias)
+        # ══════════════════════════════════════════════════════════
+        #  CONSTANTS
+        # ══════════════════════════════════════════════════════════
 
-        # Minimum detection confidence to trust a ball (filters false positives: lights, logos)
-        BALL_CONF_FLOOR = 0.30
+        # Detection
+        BALL_CONF_FLOOR = 0.30      # ignore ball detections below this confidence
 
-        # ── Smoothing ──
-        # Camera speed is driven by ball velocity (rhythm of the game).
-        # The faster the ball moves, the faster the camera follows.
-        ALPHA_GENTLE = 0.06   # ball slow / between points
-        ALPHA_NORMAL = 0.18   # ball at moderate rally speed
-        ALPHA_FAST   = 0.38   # ball moving fast (aggressive rally)
-        ALPHA_SPRINT = 0.55   # camera far behind — sprint to catch up (reduced from 0.72 to avoid snaps)
-        ALPHA_DRIFT  = 0.03   # nothing detected, drift to center
-        SPEED_SMOOTH = 0.50   # how quickly ball-speed estimate adapts (higher = faster reaction)
+        # Gravity weights (RALLY state)
+        BALL_WEIGHT_BASE = 2.5      # ball pulls 2.5× more than one player
+        PLAYER_WEIGHT    = 1.0
 
-        # Speed thresholds (as fraction of frame width per frame)
-        SPEED_FAST   = 0.040  # ball crosses >4% of frame width per frame
-        SPEED_NORMAL = 0.014  # ball crosses >1.4% of frame width per frame
+        # Spring-damper camera:
+        #   cam_vel += spring_k * (target - cam_pos)
+        #   cam_vel *= damping
+        #   cam_pos += cam_vel
+        # Higher spring_k = faster response. Damping < 1 = friction.
+        SPRING_RALLY   = 0.20       # responsive during a rally
+        SPRING_IDLE    = 0.07       # gentle between points / loft
+        SPRING_SPRINT  = 0.38       # camera way behind — race to catch up
+        DAMPING        = 0.72       # velocity retention per frame (lower = stops faster)
+        MAX_STEP_FRAC  = 0.10       # hard cap: camera moves ≤10% of crop_w per frame
 
-        # Maximum camera movement per frame (fraction of crop width) — prevents jarring snaps
-        MAX_STEP_FRAC = 0.10  # camera moves at most 10% of crop width per frame
+        # Predictive lookahead (RALLY state only)
+        # Scales from LOOKAHEAD_MIN at slow speed to LOOKAHEAD_MAX at SPEED_FAST
+        LOOKAHEAD_MIN = 4           # frames ahead at slow pace
+        LOOKAHEAD_MAX = 14          # frames ahead at fast rally speed
+        SPEED_FAST    = W * 0.040   # px/frame — ball crossing 4% of frame width
 
-        # ── State ──
-        x_smooth = W / 2.0
-        last_core_x = W / 2.0  # remember last good core position
-        last_player_centroid = W / 2.0  # fallback when ball is lost
-        prev_ball_x = None        # for computing ball velocity
-        prev_ball_y = None        # for computing ball vertical velocity
-        ball_speed_smooth = 0.0   # smoothed ball speed (px/frame)
-        ball_vy_smooth = 0.0      # smoothed vertical velocity (negative = going up)
+        # Ball velocity smoothing
+        VX_SMOOTH = 0.40            # how fast directional velocity adapts
+        VY_SMOOTH = 0.40
 
-        # Write temp then transcode
+        # Ball physics prediction (RECOVERY state)
+        PRED_VX_DECAY  = 0.88       # horizontal speed decays each predicted frame
+        PRED_VY_DECAY  = 0.95       # vertical speed decays slightly less (gravity)
+        GRAVITY        = 0.6        # px/frame² downward acceleration approximation
+        BALL_LOST_MAX  = 22         # frames of physics prediction before giving up
+
+        # LOFT detection: ball moving upward faster than this threshold
+        LOFT_VY_THRESH = -(H * 0.010)   # px/frame (negative = going up)
+
+        # Y-position ball weight: reduce pull when ball is near top of frame (mid-arc)
+        LOFT_Y_TOP   = 0.15         # above this → weight 0.3 (barely tracking)
+        LOFT_Y_TRANS = 0.28         # transition zone bottom
+
+        # Edge-proximity: if ball is this close to crop edge → force SPRING_SPRINT
+        EDGE_MARGIN_FRAC = 0.16
+
+        # ══════════════════════════════════════════════════════════
+        #  STATE
+        # ══════════════════════════════════════════════════════════
+
+        cam_pos = float(W / 2)      # camera position = center-X of crop window
+        cam_vel = 0.0               # camera velocity (px/frame)
+
+        # Ball state estimator — maintained whether ball is detected or predicted
+        est_x  = None               # estimated ball X (detected or physics)
+        est_y  = None               # estimated ball Y
+        est_vx = 0.0                # ball horizontal velocity, signed (px/frame)
+        est_vy = 0.0                # ball vertical velocity (negative = going up)
+        ball_lost_frames = 0        # consecutive frames without a detection
+
+        last_player_centroid = float(W / 2)
+
+        # ══════════════════════════════════════════════════════════
+        #  VIDEO WRITER
+        # ══════════════════════════════════════════════════════════
+
         temp_path = output_path + ".tmp.mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(temp_path, fourcc, fps, (crop_w, H))
@@ -199,15 +234,19 @@ class PadelReframer:
         frame_idx = 0
         start_time = time.time()
 
+        # ══════════════════════════════════════════════════════════
+        #  MAIN LOOP
+        # ══════════════════════════════════════════════════════════
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # ── Detect everything ──
-            ball_x = None
-            ball_y = None
-            player_xs = []   # list of x-positions for each player
+            # ── 1. Detect ──────────────────────────────────────────
+            det_ball_x = None
+            det_ball_y = None
+            player_xs  = []
 
             try:
                 results = self.model.track(
@@ -215,137 +254,140 @@ class PadelReframer:
                     classes=[self.BALL_CLASS, self.PERSON_CLASS],
                     verbose=False
                 )
-
                 if results and len(results[0].boxes) > 0:
-                    det_classes = results[0].boxes.cls.cpu().numpy()
-                    det_xywh = results[0].boxes.xywh.cpu().numpy()
-                    det_confs = results[0].boxes.conf.cpu().numpy()
+                    cls   = results[0].boxes.cls.cpu().numpy()
+                    xywh  = results[0].boxes.xywh.cpu().numpy()
+                    confs = results[0].boxes.conf.cpu().numpy()
 
-                    # Ball — take highest confidence detection above floor
-                    ball_mask = det_classes == self.BALL_CLASS
+                    ball_mask = cls == self.BALL_CLASS
                     if ball_mask.any():
-                        ball_boxes = det_xywh[ball_mask]
-                        ball_confs = det_confs[ball_mask]
-                        best_idx = np.argmax(ball_confs)
-                        if ball_confs[best_idx] >= BALL_CONF_FLOOR:
-                            ball_x = float(ball_boxes[best_idx][0])
-                            ball_y = float(ball_boxes[best_idx][1])
+                        bboxes = xywh[ball_mask]
+                        bconfs = confs[ball_mask]
+                        best   = np.argmax(bconfs)
+                        if bconfs[best] >= BALL_CONF_FLOOR:
+                            det_ball_x = float(bboxes[best][0])
+                            det_ball_y = float(bboxes[best][1])
 
-                    # Players — collect ALL their x-positions equally
-                    person_mask = det_classes == self.PERSON_CLASS
+                    person_mask = cls == self.PERSON_CLASS
                     if person_mask.any():
-                        person_boxes = det_xywh[person_mask]
-                        player_xs = [float(px) for px in person_boxes[:, 0]]
+                        player_xs = list(xywh[person_mask][:, 0].astype(float))
 
             except Exception as e:
                 if frame_idx < 3:
                     log.warning("Detection error frame %d: %s", frame_idx, e)
 
-            # ── Track player centroid (always available fallback) ──
+            # ── 2. Player centroid (always-available fallback) ─────
             if player_xs:
                 last_player_centroid = float(np.mean(player_xs))
 
-            # ── Track ball velocity (drives camera speed) ──
-            if ball_x is not None:
-                if prev_ball_x is not None:
-                    raw_speed = abs(ball_x - prev_ball_x)
-                    ball_speed_smooth = ball_speed_smooth * (1 - SPEED_SMOOTH) + raw_speed * SPEED_SMOOTH
-                    # Use the peak of raw vs smoothed so sudden fast moves register instantly
-                    effective_ball_speed = max(raw_speed, ball_speed_smooth)
-                else:
-                    effective_ball_speed = ball_speed_smooth
-                prev_ball_x = ball_x
-
-                # Track vertical velocity: negative = ball going up
-                if prev_ball_y is not None:
-                    raw_vy = ball_y - prev_ball_y
-                    ball_vy_smooth = ball_vy_smooth * 0.6 + raw_vy * 0.4
-                prev_ball_y = ball_y
+            # ── 3. Ball state estimator ────────────────────────────
+            if det_ball_x is not None:
+                # Ball detected — update velocity and reset lost counter
+                if est_x is not None:
+                    raw_vx = det_ball_x - est_x
+                    raw_vy = det_ball_y - est_y
+                    est_vx = est_vx * (1 - VX_SMOOTH) + raw_vx * VX_SMOOTH
+                    est_vy = est_vy * (1 - VY_SMOOTH) + raw_vy * VY_SMOOTH
+                est_x = det_ball_x
+                est_y = det_ball_y
+                ball_lost_frames = 0
             else:
-                ball_speed_smooth *= 0.88  # decay speed gradually when ball lost
-                effective_ball_speed = ball_speed_smooth
-                ball_vy_smooth *= 0.80     # decay vertical velocity when ball lost
+                # Ball not detected — run physics prediction
+                ball_lost_frames += 1
+                if est_x is not None and ball_lost_frames <= BALL_LOST_MAX:
+                    est_x  += est_vx
+                    est_y  += est_vy
+                    est_vx *= PRED_VX_DECAY
+                    est_vy  = est_vy * PRED_VY_DECAY + GRAVITY  # gravity pulls down
+                    # Give up if prediction exits the frame
+                    if est_x < 0 or est_x > W or est_y < 0 or est_y > H * 1.15:
+                        est_x = None
+                elif ball_lost_frames > BALL_LOST_MAX:
+                    est_x = None
 
-            # ── Ball weight: reduce when ball is near top of frame (about to exit) ──
-            # A ball in the top 20% of the frame is likely mid-arc / leaving view.
-            # Reducing its pull prevents the camera from chasing it off-screen.
-            if ball_x is not None and ball_y is not None:
-                if ball_y < H * 0.15:
-                    effective_ball_weight = 0.4   # near top edge — barely follow
-                elif ball_y < H * 0.25:
-                    frac = (ball_y - H * 0.15) / (H * 0.10)
-                    effective_ball_weight = 0.4 + frac * (BALL_WEIGHT_BASE - 0.4)
-                else:
-                    effective_ball_weight = BALL_WEIGHT_BASE
+            # ── 4. Game state ──────────────────────────────────────
+            ball_rising   = est_vy < LOFT_VY_THRESH
+            ball_near_top = est_y is not None and est_y < H * LOFT_Y_TOP
+
+            if est_x is None:
+                game_state = "IDLE"
+            elif ball_rising or ball_near_top:
+                game_state = "LOFT"
+            elif ball_lost_frames > 0:
+                game_state = "RECOVERY"
             else:
-                effective_ball_weight = 0.0
+                game_state = "RALLY"
 
-            # ── Compute gravity core ──
-            # Every detected object is a point with a weight.
-            # Core = weighted average of all points.
-            points = []
-            weights = []
+            # ── 5. Compute target_x and spring_k per state ─────────
+            if game_state == "IDLE":
+                target_x = last_player_centroid
+                spring_k  = SPRING_IDLE
 
-            if ball_x is not None:
-                points.append(ball_x)
-                weights.append(effective_ball_weight)
-
-            for px in player_xs:
-                points.append(px)
-                weights.append(PLAYER_WEIGHT)
-
-            if len(points) > 0:
-                # Weighted center of mass
-                points = np.array(points)
-                weights = np.array(weights)
-                core_x = float(np.average(points, weights=weights))
-                last_core_x = core_x
-
-                # Alpha driven by ball speed — fast ball = fast camera
-                speed_ratio = effective_ball_speed / W
-                if speed_ratio > SPEED_FAST:
-                    speed_alpha = ALPHA_FAST
-                elif speed_ratio > SPEED_NORMAL:
-                    speed_alpha = ALPHA_NORMAL
+            elif game_state == "LOFT":
+                # Ball is mid-arc — camera holds on players.
+                # Blend in a tiny bit of ball X so the camera doesn't completely
+                # ignore lateral movement during a loft.
+                if player_xs:
+                    target_x = last_player_centroid * 0.88 + est_x * 0.12
                 else:
-                    speed_alpha = ALPHA_GENTLE
+                    target_x = est_x
+                spring_k = SPRING_IDLE
 
-                # Position shift — sprint when camera is far behind
-                shift = abs(core_x - x_smooth) / W
-                if shift > 0.25:
-                    shift_alpha = ALPHA_SPRINT  # too far behind — race to catch up
-                elif shift > 0.12:
-                    shift_alpha = ALPHA_FAST
-                elif shift > 0.06:
-                    shift_alpha = ALPHA_NORMAL
+            elif game_state == "RECOVERY":
+                # Physics prediction active — fade ball influence to zero as it ages
+                fade     = 1.0 - (ball_lost_frames / BALL_LOST_MAX)
+                target_x = est_x * fade + last_player_centroid * (1.0 - fade)
+                spring_k = SPRING_IDLE
+
+            else:  # RALLY
+                # ── Predictive lookahead ──
+                speed_abs = abs(est_vx)
+                lookahead = LOOKAHEAD_MIN + (LOOKAHEAD_MAX - LOOKAHEAD_MIN) * min(1.0, speed_abs / SPEED_FAST)
+                pred_x    = float(np.clip(est_x + est_vx * lookahead, 0, W))
+
+                # ── Y-aware ball weight (near top = mid-arc = reduce pull) ──
+                if est_y < H * LOFT_Y_TOP:
+                    eff_ball_w = 0.3
+                elif est_y < H * LOFT_Y_TRANS:
+                    frac       = (est_y - H * LOFT_Y_TOP) / (H * (LOFT_Y_TRANS - LOFT_Y_TOP))
+                    eff_ball_w = 0.3 + frac * (BALL_WEIGHT_BASE - 0.3)
                 else:
-                    shift_alpha = ALPHA_GENTLE
+                    eff_ball_w = BALL_WEIGHT_BASE
 
-                alpha = max(speed_alpha, shift_alpha)
+                # ── Gravity core: predicted ball + players ──
+                pts = [pred_x] + player_xs
+                wts = [eff_ball_w] + [PLAYER_WEIGHT] * len(player_xs)
+                target_x = float(np.average(pts, weights=wts))
 
-            else:
-                # Nothing detected — if ball was going up when lost, snap back to
-                # players quickly (ball left the frame). Otherwise drift gently.
-                ball_was_rising = ball_vy_smooth < -(H * 0.008)
-                if ball_was_rising and player_xs:
-                    core_x = last_player_centroid
-                    alpha = ALPHA_NORMAL  # return to players promptly
+                # ── Spring stiffness scales with distance gap ──
+                gap_frac = abs(target_x - cam_pos) / W
+                if gap_frac > 0.25:
+                    spring_k = SPRING_SPRINT
+                elif gap_frac > 0.10:
+                    spring_k = SPRING_RALLY * 1.25
                 else:
-                    core_x = last_core_x * 0.9 + (W / 2.0) * 0.1
-                    alpha = ALPHA_DRIFT
-                last_core_x = core_x
+                    spring_k = SPRING_RALLY
 
-            # ── Smooth camera movement with per-frame movement cap ──
-            target_x = x_smooth * (1 - alpha) + core_x * alpha
+                # ── Edge-proximity safety net ──
+                # If ball is already near the crop edge, force sprint regardless
+                crop_left    = cam_pos - crop_w / 2
+                ball_in_crop = est_x - crop_left
+                edge_margin  = crop_w * EDGE_MARGIN_FRAC
+                if ball_in_crop < edge_margin or ball_in_crop > (crop_w - edge_margin):
+                    spring_k = SPRING_SPRINT
+
+            # ── 6. Spring-damper camera update ────────────────────
+            cam_vel += spring_k * (target_x - cam_pos)
+            cam_vel *= DAMPING
             max_step = crop_w * MAX_STEP_FRAC
-            x_smooth = x_smooth + float(np.clip(target_x - x_smooth, -max_step, max_step))
+            cam_vel  = float(np.clip(cam_vel, -max_step, max_step))
+            cam_pos += cam_vel
 
-            # ── Clamp and crop ──
-            x1 = int(max(0, min(W - crop_w, x_smooth - crop_w / 2)))
+            # ── 7. Clamp and crop ──────────────────────────────────
+            x1 = int(max(0, min(W - crop_w, cam_pos - crop_w / 2)))
             writer.write(frame[0:H, x1:x1 + crop_w])
             frame_idx += 1
 
-            # Progress
             if progress_callback and frame_idx % 30 == 0:
                 pct = min(99, int(frame_idx / total_frames * 100))
                 progress_callback(pct, frame_idx, total_frames)
