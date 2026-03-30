@@ -1,0 +1,6 @@
+reframer_uploads/
+reframer_outputs/
+reframer_temp/
+*.pt
+__pycache__/
+*.pyc
