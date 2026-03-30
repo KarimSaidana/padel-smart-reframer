@@ -221,12 +221,17 @@ class PadelReframer:
         EDGE_MARGIN_FRAC  = 0.14
         EDGE_SPRING_BOOST = 1.6     # multiply spring_k (not replace with SPRINT)
 
+        # Player containment
+        # Stable bounds update slowly so missed detections don't suddenly drift the camera.
+        STABLE_PLAYER_ALPHA = 0.06  # slow EMA — persists through detection gaps
+        PLAYER_MARGIN       = 25    # px: outermost player must stay this far from crop edge
+
         # ══════════════════════════════════════════════════════════
         #  STATE
         # ══════════════════════════════════════════════════════════
 
-        cam_pos      = float(W / 2)
-        cam_vel      = 0.0
+        cam_pos       = float(W / 2)
+        cam_vel       = 0.0
         target_smooth = float(W / 2)   # smoothed target — what the spring actually chases
 
         # Ball state estimator
@@ -236,7 +241,9 @@ class PadelReframer:
         est_vy = 0.0
         ball_lost_frames = 0
 
-        last_player_centroid = float(W / 2)
+        # Stable player bounds — updated slowly each frame
+        stable_p_left  = float(W * 0.25)
+        stable_p_right = float(W * 0.75)
 
         # Reversal tracker
         prev_vel_sign  = 0
@@ -300,9 +307,20 @@ class PadelReframer:
                 if frame_idx < 3:
                     log.warning("Detection error frame %d: %s", frame_idx, e)
 
-            # ── 2. Player centroid (always-available fallback) ─────
+            # ── 2. Player bounds tracker ───────────────────────────
+            # Stable bounds update slowly — if YOLO misses a player for a few frames,
+            # the camera doesn't suddenly drift toward the empty side.
             if player_xs:
-                last_player_centroid = float(np.mean(player_xs))
+                p_left  = min(player_xs)
+                p_right = max(player_xs)
+                stable_p_left  = stable_p_left  * (1 - STABLE_PLAYER_ALPHA) + p_left  * STABLE_PLAYER_ALPHA
+                stable_p_right = stable_p_right * (1 - STABLE_PLAYER_ALPHA) + p_right * STABLE_PLAYER_ALPHA
+
+            player_midpoint = (stable_p_left + stable_p_right) / 2.0
+            player_span     = stable_p_right - stable_p_left
+            # Slack = how much room remains in the crop after fitting all players.
+            # Ball can only shift the camera within this budget.
+            slack = max(0.0, crop_w - player_span - 2 * PLAYER_MARGIN)
 
             # ── 3. Ball state estimator ────────────────────────────
             if det_ball_x is not None:
@@ -353,21 +371,19 @@ class PadelReframer:
 
             # ── 5. Compute raw target and spring_k per state ───────
             if game_state == "IDLE":
-                raw_target = last_player_centroid
+                raw_target = player_midpoint
                 spring_k   = SPRING_IDLE
                 t_retain   = T_IDLE
 
             elif game_state == "LOFT":
-                if player_xs:
-                    raw_target = last_player_centroid * 0.88 + est_x * 0.12
-                else:
-                    raw_target = est_x
-                spring_k = SPRING_IDLE
-                t_retain = T_LOFT
+                # Hold on player midpoint; tiny hint of ball X so we're not blind to it
+                raw_target = player_midpoint * 0.90 + est_x * 0.10
+                spring_k   = SPRING_IDLE
+                t_retain   = T_LOFT
 
             elif game_state == "RECOVERY":
                 fade       = 1.0 - (ball_lost_frames / BALL_LOST_MAX)
-                raw_target = est_x * fade + last_player_centroid * (1.0 - fade)
+                raw_target = est_x * fade + player_midpoint * (1.0 - fade)
                 spring_k   = SPRING_IDLE
                 t_retain   = T_RECOVERY
 
@@ -384,9 +400,11 @@ class PadelReframer:
                 else:
                     eff_ball_w = BALL_WEIGHT_BASE
 
-                pts = [pred_x] + player_xs
-                wts = [eff_ball_w] + [PLAYER_WEIGHT] * len(player_xs)
-                raw_target = float(np.average(pts, weights=wts))
+                # Ball shifts camera from player_midpoint, but only within slack budget.
+                # This guarantees all players stay in frame while still following the ball.
+                ball_shift = (pred_x - player_midpoint) * (eff_ball_w / (eff_ball_w + PLAYER_WEIGHT * max(1, len(player_xs))))
+                ball_shift = float(np.clip(ball_shift, -slack / 2, slack / 2))
+                raw_target = player_midpoint + ball_shift
 
                 gap_frac = abs(raw_target - cam_pos) / W
                 if gap_frac > 0.25:
@@ -405,9 +423,10 @@ class PadelReframer:
 
                 t_retain = T_RALLY
 
-            # ── 5b. Center bias — always pull raw target toward W/2 ──
-            # This keeps the camera away from glass/walls unless action forces it out.
-            raw_target = raw_target * (1.0 - CENTER_BIAS) + (W / 2.0) * CENTER_BIAS
+            # ── 5b. Player-midpoint bias — always drift toward player_midpoint ──
+            # Replaces old W/2 center bias: camera naturally rests where the players are,
+            # not at the geometric center of the original frame.
+            raw_target = raw_target * (1.0 - CENTER_BIAS) + player_midpoint * CENTER_BIAS
 
             # ── 5c. Smooth the target (low-pass filter) ────────────
             # The spring never sees raw target jumps — only the smoothed version.
@@ -432,6 +451,15 @@ class PadelReframer:
             max_step = crop_w * MAX_STEP_FRAC
             cam_vel  = float(np.clip(cam_vel, -max_step, max_step))
             cam_pos += cam_vel
+
+            # ── 6b. Hard player-visibility clamp ──────────────────
+            # After all smoothing, guarantee outermost players are inside the crop.
+            # Only applied when players actually fit within crop_w.
+            if player_span <= crop_w - 2 * PLAYER_MARGIN:
+                cam_min = stable_p_right - crop_w / 2 + PLAYER_MARGIN
+                cam_max = stable_p_left  + crop_w / 2 - PLAYER_MARGIN
+                if cam_min <= cam_max:  # sanity check
+                    cam_pos = float(np.clip(cam_pos, cam_min, cam_max))
 
             # ── 7. Clamp and crop ──────────────────────────────────
             x1 = int(max(0, min(W - crop_w, cam_pos - crop_w / 2)))
