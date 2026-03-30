@@ -184,13 +184,13 @@ class PadelReframer:
         # Center bias: always pull toward W/2 (the net / court center line).
         # This is the camera's home — it rests here and returns here after action.
         HOME             = float(W / 2)
-        CENTER_BIAS      = 0.25         # 25% pull toward HOME every frame
+        CENTER_BIAS      = 0.35         # 35% pull toward HOME every frame
 
         SPRING_RALLY   = 0.14
-        SPRING_IDLE    = 0.09           # stronger return to HOME between points
-        SPRING_SPRINT  = 0.32           # genuine big transitions
+        SPRING_IDLE    = 0.16           # fast return to HOME between points
+        SPRING_SPRINT  = 0.32
         DAMPING        = 0.80
-        MAX_STEP_FRAC  = 0.09           # allow bigger per-frame steps for big pans
+        MAX_STEP_FRAC  = 0.09
 
         REVERSAL_DECAY    = 0.92
         REVERSAL_PENALISE = 3.0
@@ -213,18 +213,16 @@ class PadelReframer:
         LOFT_Y_TRANS   = 0.28
 
         STABLE_PLAYER_ALPHA = 0.06
-        # Player margin: just enough to keep players barely visible.
-        # NOT used to restrict ball-following — camera follows ball freely.
-        PLAYER_MARGIN       = 10
 
         # Path planning: smoothing sigmas (in frames)
-        SIGMA_RALLY    = fps * 0.18   # 0.18 s — responsive; allows big fast pans
-        SIGMA_IDLE     = fps * 1.50   # 1.5 s — rock-solid between points
-        # Future blend: mix current raw target with weighted average of next N frames
+        # SIGMA_IDLE must be SHORT so return-to-HOME isn't delayed by the
+        # bidirectional Gaussian averaging across the RALLY→IDLE boundary.
+        SIGMA_RALLY    = fps * 0.18   # 0.18 s — responsive during rallies
+        SIGMA_IDLE     = fps * 0.25   # 0.25 s — camera snaps to HOME quickly
+        # Future blend
         FUTURE_FRAMES  = int(fps * 0.40)
         FUTURE_DECAY   = 0.88
-        # A transition is "genuine" if planned path moves this much in 0.3 s
-        FAST_PAN_THRESH = crop_w * 0.14   # lower threshold — detect more transitions
+        FAST_PAN_THRESH = crop_w * 0.14
 
         start_time = time.time()
 
@@ -444,16 +442,6 @@ class PadelReframer:
             cam_vel *= DAMPING
             cam_vel  = float(np.clip(cam_vel, -crop_w * MAX_STEP_FRAC, crop_w * MAX_STEP_FRAC))
             cam_pos += cam_vel
-
-            # Hard player-visibility clamp
-            pl, pr = player_bounds[f]
-            p_span = pr - pl
-            if p_span <= crop_w - 2 * PLAYER_MARGIN:
-                cam_min = pr - crop_w / 2 + PLAYER_MARGIN
-                cam_max = pl + crop_w / 2 - PLAYER_MARGIN
-                if cam_min <= cam_max:
-                    cam_pos = float(np.clip(cam_pos, cam_min, cam_max))
-
             cam_path[f] = cam_pos
 
         log.info("Path planning done")
