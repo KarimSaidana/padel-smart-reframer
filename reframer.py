@@ -115,19 +115,37 @@ class PadelReframer:
             self.model = YOLO(model_path)
             log.info("YOLO model loaded: %s", model_path)
 
+    @staticmethod
+    def _gauss_smooth(arr, sigma):
+        """1D Gaussian smoother — no scipy needed."""
+        if sigma <= 0:
+            return arr.copy()
+        radius = min(int(3 * sigma + 0.5), len(arr) // 2)
+        if radius == 0:
+            return arr.copy()
+        k = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma) ** 2)
+        k /= k.sum()
+        padded = np.pad(arr, radius, mode='edge')
+        result = np.convolve(padded, k, mode='valid')
+        return result[:len(arr)]
+
     def reframe(self, input_path, output_path, progress_callback=None):
         """
-        Broadcast-style reframing with game-state awareness.
+        Two-pass broadcast reframing — the camera knows the full story first.
 
-        Four game states drive all camera decisions:
-          RALLY    — ball detected and moving  → predictive tracking, ball leads camera
-          LOFT     — ball going upward fast    → hold on players, ignore arc position
-          RECOVERY — ball just disappeared     → physics prediction fades into players
-          IDLE     — no ball for a while       → stable wide shot on players
+        Pass 1  — Run YOLO on every frame; store detections (no rendering).
+        Planning — With the full sequence known, compute ball trajectory, player
+                   bounds, game states, then build a camera path using:
+                     • Future-blending: target for frame F includes knowledge of
+                       what happens in the next ~0.5 s
+                     • Bidirectional Gaussian smoothing: path is smooth both
+                       forward and backward around each event
+                     • Genuine fast-pan detection: if the path genuinely needs
+                       to move quickly, the spring is allowed to sprint
+        Pass 2  — Render video against the pre-computed camera path.
 
-        Camera movement uses a spring-damper model (position + velocity) so it
-        naturally accelerates into a pan and decelerates smoothly into the target,
-        with no snapping or exponential-smoothing artifacts.
+        Because the camera knows the whole point before committing, transitions
+        are planned arcs rather than reactive lurches.
         """
         if self.model is None:
             log.error("No YOLO model available")
@@ -158,127 +176,66 @@ class PadelReframer:
         #  CONSTANTS
         # ══════════════════════════════════════════════════════════
 
-        # Detection
-        BALL_CONF_FLOOR  = 0.30     # ignore ball detections below this confidence
-        MAX_BALL_JUMP    = W * 0.18 # max believable ball jump per frame (outlier rejection)
+        BALL_CONF_FLOOR  = 0.30
+        MAX_BALL_JUMP    = W * 0.18
 
-        # Gravity weights (RALLY state)
         BALL_WEIGHT_BASE = 2.5
         PLAYER_WEIGHT    = 1.0
+        CENTER_BIAS      = 0.20
 
-        # Center bias — always pull target toward W/2 by this fraction.
-        # Prevents camera from drifting into glass/walls between points.
-        CENTER_BIAS = 0.22
+        SPRING_RALLY   = 0.13
+        SPRING_IDLE    = 0.05
+        SPRING_SPRINT  = 0.28       # only used for genuine fast pans
+        DAMPING        = 0.80
+        MAX_STEP_FRAC  = 0.07
 
-        # Spring-damper camera (deliberately soft — smoothness > speed):
-        #   cam_vel += spring_k * (target_smooth - cam_pos)
-        #   cam_vel *= DAMPING
-        #   cam_pos += cam_vel
-        SPRING_RALLY  = 0.11        # rally tracking
-        SPRING_IDLE   = 0.05        # between points / loft / recovery
-        SPRING_SPRINT = 0.20        # camera significantly behind (was 0.38 — reduced to kill lurches)
-        DAMPING       = 0.82        # higher = smoother stop (was 0.72)
-        MAX_STEP_FRAC = 0.055       # hard cap per frame — 5.5% of crop_w (was 10%)
+        REVERSAL_DECAY    = 0.92
+        REVERSAL_PENALISE = 3.0
+        REVERSAL_FACTOR   = 0.40
 
-        # Target smoothing — the target itself is low-pass filtered before the spring
-        # sees it. This is the main fix for jitter: even a sudden ball jump creates
-        # a gradual target shift, so the camera can't lunge.
-        # T_* = retention per frame (higher = slower target movement)
-        T_RALLY    = 0.80           # target updates at moderate pace during rally
-        T_IDLE     = 0.94           # target barely moves between points
-        T_LOFT     = 0.92           # hold steady during ball arc
-        T_RECOVERY = 0.90           # gentle fade back to players
-
-        # Transition rate limiter — track direction reversals; if too many in a short
-        # window, penalise spring_k so the camera commits to one direction.
-        REVERSAL_DECAY    = 0.92    # reversal score decays each frame
-        REVERSAL_PENALISE = 3.0     # score above this → apply penalty
-        REVERSAL_FACTOR   = 0.40    # spring_k multiplied by this when oscillating
-
-        # Predictive lookahead (RALLY state only)
         LOOKAHEAD_MIN = 3
-        LOOKAHEAD_MAX = 10          # reduced from 14 — less overshoot
+        LOOKAHEAD_MAX = 10
         SPEED_FAST    = W * 0.040
 
-        # Ball velocity smoothing
-        VX_SMOOTH = 0.30            # slower adaptation → less reaction to single-frame noise
-        VY_SMOOTH = 0.35
+        VX_SMOOTH = 0.28
+        VY_SMOOTH = 0.32
 
-        # Ball physics prediction (RECOVERY state)
         PRED_VX_DECAY = 0.88
         PRED_VY_DECAY = 0.95
         GRAVITY       = 0.6
-        BALL_LOST_MAX = 35          # longer prediction window before giving up (was 22)
+        BALL_LOST_MAX = 35
 
-        # LOFT detection
         LOFT_VY_THRESH = -(H * 0.010)
+        LOFT_Y_TOP     = 0.15
+        LOFT_Y_TRANS   = 0.28
 
-        # Y-position ball weight
-        LOFT_Y_TOP   = 0.15
-        LOFT_Y_TRANS = 0.28
+        STABLE_PLAYER_ALPHA = 0.06
+        PLAYER_MARGIN       = 25
 
-        # Edge-proximity boost (gentle — no more SPRINT lurch)
-        EDGE_MARGIN_FRAC  = 0.14
-        EDGE_SPRING_BOOST = 1.6     # multiply spring_k (not replace with SPRINT)
+        # Path planning: smoothing sigmas (in frames)
+        SIGMA_RALLY    = fps * 0.30   # 0.3 s — keeps responsiveness during rallies
+        SIGMA_IDLE     = fps * 1.20   # 1.2 s — very stable between points
+        # Future blend: mix current raw target with weighted average of next N frames
+        FUTURE_FRAMES  = int(fps * 0.45)   # 0.45 s look-ahead
+        FUTURE_DECAY   = 0.88              # weight of each successive future frame
+        # A transition is "genuine" if the planned path moves this much in 0.3 s
+        FAST_PAN_THRESH = crop_w * 0.18
 
-        # Player containment
-        # Stable bounds update slowly so missed detections don't suddenly drift the camera.
-        STABLE_PLAYER_ALPHA = 0.06  # slow EMA — persists through detection gaps
-        PLAYER_MARGIN       = 25    # px: outermost player must stay this far from crop edge
-
-        # ══════════════════════════════════════════════════════════
-        #  STATE
-        # ══════════════════════════════════════════════════════════
-
-        cam_pos       = float(W / 2)
-        cam_vel       = 0.0
-        target_smooth = float(W / 2)   # smoothed target — what the spring actually chases
-
-        # Ball state estimator
-        est_x  = None
-        est_y  = None
-        est_vx = 0.0
-        est_vy = 0.0
-        ball_lost_frames = 0
-
-        # Stable player bounds — updated slowly each frame
-        stable_p_left  = float(W * 0.25)
-        stable_p_right = float(W * 0.75)
-
-        # Reversal tracker
-        prev_vel_sign  = 0
-        reversal_score = 0.0
-
-        # ══════════════════════════════════════════════════════════
-        #  VIDEO WRITER
-        # ══════════════════════════════════════════════════════════
-
-        temp_path = output_path + ".tmp.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(temp_path, fourcc, fps, (crop_w, H))
-
-        if not writer.isOpened():
-            log.error("Cannot create VideoWriter")
-            cap.release()
-            return None
-
-        frame_idx = 0
         start_time = time.time()
 
         # ══════════════════════════════════════════════════════════
-        #  MAIN LOOP
+        #  PASS 1 — Collect detections
         # ══════════════════════════════════════════════════════════
+
+        all_dets = []   # list of {'ball_x', 'ball_y', 'player_xs'} per frame
+        frame_idx = 0
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # ── 1. Detect ──────────────────────────────────────────
-            det_ball_x = None
-            det_ball_y = None
-            player_xs  = []
-
+            det = {'ball_x': None, 'ball_y': None, 'player_xs': []}
             try:
                 results = self.model.track(
                     frame, persist=True,
@@ -292,63 +249,74 @@ class PadelReframer:
 
                     ball_mask = cls == self.BALL_CLASS
                     if ball_mask.any():
-                        bboxes = xywh[ball_mask]
-                        bconfs = confs[ball_mask]
-                        best   = np.argmax(bconfs)
+                        bboxes = xywh[ball_mask]; bconfs = confs[ball_mask]
+                        best = np.argmax(bconfs)
                         if bconfs[best] >= BALL_CONF_FLOOR:
-                            det_ball_x = float(bboxes[best][0])
-                            det_ball_y = float(bboxes[best][1])
+                            det['ball_x'] = float(bboxes[best][0])
+                            det['ball_y'] = float(bboxes[best][1])
 
                     person_mask = cls == self.PERSON_CLASS
                     if person_mask.any():
-                        player_xs = list(xywh[person_mask][:, 0].astype(float))
+                        det['player_xs'] = list(xywh[person_mask][:, 0].astype(float))
 
             except Exception as e:
                 if frame_idx < 3:
                     log.warning("Detection error frame %d: %s", frame_idx, e)
 
-            # ── 2. Player bounds tracker ───────────────────────────
-            # Stable bounds update slowly — if YOLO misses a player for a few frames,
-            # the camera doesn't suddenly drift toward the empty side.
-            if player_xs:
-                p_left  = min(player_xs)
-                p_right = max(player_xs)
-                stable_p_left  = stable_p_left  * (1 - STABLE_PLAYER_ALPHA) + p_left  * STABLE_PLAYER_ALPHA
-                stable_p_right = stable_p_right * (1 - STABLE_PLAYER_ALPHA) + p_right * STABLE_PLAYER_ALPHA
+            all_dets.append(det)
+            frame_idx += 1
 
-            player_midpoint = (stable_p_left + stable_p_right) / 2.0
-            player_span     = stable_p_right - stable_p_left
-            # Slack = how much room remains in the crop after fitting all players.
-            # Ball can only shift the camera within this budget.
-            slack = max(0.0, crop_w - player_span - 2 * PLAYER_MARGIN)
+            if progress_callback and frame_idx % 30 == 0:
+                pct = min(48, int(frame_idx / total_frames * 49))
+                progress_callback(pct, frame_idx, total_frames)
 
-            # ── 3. Ball state estimator ────────────────────────────
-            if det_ball_x is not None:
+        cap.release()
+        N = len(all_dets)
+        log.info("Pass 1 done: %d frames", N)
+        if N == 0:
+            return None
+
+        # ══════════════════════════════════════════════════════════
+        #  PATH PLANNING
+        # ══════════════════════════════════════════════════════════
+
+        if progress_callback:
+            progress_callback(49, N, N)
+
+        # ── A. Forward ball state estimation ──────────────────────
+        est_x = None; est_y = None; est_vx = 0.0; est_vy = 0.0
+        ball_lost_frames = 0
+        stable_p_left  = W * 0.25
+        stable_p_right = W * 0.75
+
+        ball_states   = []   # (est_x, est_y, est_vx, est_vy, lost_frames)
+        player_bounds = []   # (stable_p_left, stable_p_right)
+        game_states   = []
+
+        for det in all_dets:
+            bx = det['ball_x']; by = det['ball_y']
+            pxs = det['player_xs']
+
+            if pxs:
+                stable_p_left  = stable_p_left  * (1 - STABLE_PLAYER_ALPHA) + min(pxs) * STABLE_PLAYER_ALPHA
+                stable_p_right = stable_p_right * (1 - STABLE_PLAYER_ALPHA) + max(pxs) * STABLE_PLAYER_ALPHA
+            player_bounds.append((stable_p_left, stable_p_right))
+
+            if bx is not None:
                 if est_x is not None:
-                    # Outlier rejection: if detection is far from predicted position,
-                    # it's likely a false positive or tracking glitch — partially trust it.
-                    predicted_x = est_x + est_vx
-                    predicted_y = est_y + est_vy
-                    jump = abs(det_ball_x - predicted_x)
+                    jump = abs(bx - (est_x + est_vx))
                     if jump > MAX_BALL_JUMP:
                         trust = max(0.25, 1.0 - (jump - MAX_BALL_JUMP) / (W * 0.30))
-                        det_ball_x = predicted_x * (1 - trust) + det_ball_x * trust
-                        det_ball_y = predicted_y * (1 - trust) + det_ball_y * trust
-
-                    raw_vx = det_ball_x - est_x
-                    raw_vy = det_ball_y - est_y
-                    est_vx = est_vx * (1 - VX_SMOOTH) + raw_vx * VX_SMOOTH
-                    est_vy = est_vy * (1 - VY_SMOOTH) + raw_vy * VY_SMOOTH
-
-                est_x = det_ball_x
-                est_y = det_ball_y
+                        bx = (est_x + est_vx) * (1 - trust) + bx * trust
+                        by = (est_y + est_vy) * (1 - trust) + by * trust
+                    est_vx = est_vx * (1 - VX_SMOOTH) + (bx - est_x) * VX_SMOOTH
+                    est_vy = est_vy * (1 - VY_SMOOTH) + (by - est_y) * VY_SMOOTH
+                est_x = bx; est_y = by
                 ball_lost_frames = 0
             else:
-                # Ball not detected — run physics prediction
                 ball_lost_frames += 1
                 if est_x is not None and ball_lost_frames <= BALL_LOST_MAX:
-                    est_x  += est_vx
-                    est_y  += est_vy
+                    est_x += est_vx; est_y += est_vy
                     est_vx *= PRED_VX_DECAY
                     est_vy  = est_vy * PRED_VY_DECAY + GRAVITY
                     if est_x < 0 or est_x > W or est_y < 0 or est_y > H * 1.15:
@@ -356,130 +324,166 @@ class PadelReframer:
                 elif ball_lost_frames > BALL_LOST_MAX:
                     est_x = None
 
-            # ── 4. Game state ──────────────────────────────────────
+            ball_states.append((est_x, est_y, est_vx, est_vy, ball_lost_frames))
+
             ball_rising   = est_vy < LOFT_VY_THRESH
             ball_near_top = est_y is not None and est_y < H * LOFT_Y_TOP
-
             if est_x is None:
-                game_state = "IDLE"
+                gs = "IDLE"
             elif ball_rising or ball_near_top:
-                game_state = "LOFT"
+                gs = "LOFT"
             elif ball_lost_frames > 0:
-                game_state = "RECOVERY"
+                gs = "RECOVERY"
             else:
-                game_state = "RALLY"
+                gs = "RALLY"
+            game_states.append(gs)
 
-            # ── 5. Compute raw target and spring_k per state ───────
-            if game_state == "IDLE":
-                raw_target = player_midpoint
-                spring_k   = SPRING_IDLE
-                t_retain   = T_IDLE
+        # ── B. Compute raw targets ─────────────────────────────────
+        raw_targets = np.zeros(N)
+        for f in range(N):
+            bx, by, bvx, _, blf = ball_states[f]
+            pxs = all_dets[f]['player_xs']
+            pl, pr = player_bounds[f]
+            gs = game_states[f]
+            player_midpoint = (pl + pr) / 2.0
+            player_span     = pr - pl
+            slack = max(0.0, crop_w - player_span - 2 * PLAYER_MARGIN)
 
-            elif game_state == "LOFT":
-                # Hold on player midpoint; tiny hint of ball X so we're not blind to it
-                raw_target = player_midpoint * 0.90 + est_x * 0.10
-                spring_k   = SPRING_IDLE
-                t_retain   = T_LOFT
-
-            elif game_state == "RECOVERY":
-                fade       = 1.0 - (ball_lost_frames / BALL_LOST_MAX)
-                raw_target = est_x * fade + player_midpoint * (1.0 - fade)
-                spring_k   = SPRING_IDLE
-                t_retain   = T_RECOVERY
-
+            if gs == "IDLE":
+                raw = player_midpoint
+            elif gs == "LOFT":
+                raw = player_midpoint * 0.90 + bx * 0.10
+            elif gs == "RECOVERY":
+                fade = 1.0 - (blf / BALL_LOST_MAX)
+                raw = bx * fade + player_midpoint * (1.0 - fade)
             else:  # RALLY
-                speed_abs = abs(est_vx)
+                speed_abs = abs(bvx)
                 lookahead = LOOKAHEAD_MIN + (LOOKAHEAD_MAX - LOOKAHEAD_MIN) * min(1.0, speed_abs / SPEED_FAST)
-                pred_x    = float(np.clip(est_x + est_vx * lookahead, 0, W))
+                pred_x = float(np.clip(bx + bvx * lookahead, 0, W))
 
-                if est_y < H * LOFT_Y_TOP:
-                    eff_ball_w = 0.3
-                elif est_y < H * LOFT_Y_TRANS:
-                    frac       = (est_y - H * LOFT_Y_TOP) / (H * (LOFT_Y_TRANS - LOFT_Y_TOP))
-                    eff_ball_w = 0.3 + frac * (BALL_WEIGHT_BASE - 0.3)
+                if by < H * LOFT_Y_TOP:
+                    eff_w = 0.3
+                elif by < H * LOFT_Y_TRANS:
+                    frac  = (by - H * LOFT_Y_TOP) / (H * (LOFT_Y_TRANS - LOFT_Y_TOP))
+                    eff_w = 0.3 + frac * (BALL_WEIGHT_BASE - 0.3)
                 else:
-                    eff_ball_w = BALL_WEIGHT_BASE
+                    eff_w = BALL_WEIGHT_BASE
 
-                # Ball shifts camera from player_midpoint, but only within slack budget.
-                # This guarantees all players stay in frame while still following the ball.
-                ball_shift = (pred_x - player_midpoint) * (eff_ball_w / (eff_ball_w + PLAYER_WEIGHT * max(1, len(player_xs))))
+                n_players  = max(1, len(pxs))
+                ball_shift = (pred_x - player_midpoint) * (eff_w / (eff_w + PLAYER_WEIGHT * n_players))
                 ball_shift = float(np.clip(ball_shift, -slack / 2, slack / 2))
-                raw_target = player_midpoint + ball_shift
+                raw = player_midpoint + ball_shift
 
-                gap_frac = abs(raw_target - cam_pos) / W
-                if gap_frac > 0.25:
-                    spring_k = SPRING_SPRINT
-                elif gap_frac > 0.10:
-                    spring_k = SPRING_RALLY * 1.20
-                else:
-                    spring_k = SPRING_RALLY
+            raw = raw * (1.0 - CENTER_BIAS) + player_midpoint * CENTER_BIAS
+            raw_targets[f] = raw
 
-                # Edge-proximity: boost spring gently (not replace with sprint)
-                crop_left    = cam_pos - crop_w / 2
-                ball_in_crop = est_x - crop_left
-                edge_margin  = crop_w * EDGE_MARGIN_FRAC
-                if ball_in_crop < edge_margin or ball_in_crop > (crop_w - edge_margin):
-                    spring_k = min(SPRING_SPRINT, spring_k * EDGE_SPRING_BOOST)
+        # ── C. Future-blend — mix raw target with near-future knowledge ──
+        # Camera for frame F already "knows" what happens in the next 0.45 s.
+        # Result: no lag on steady movements; early start on transitions.
+        planned = np.zeros(N)
+        future_weights = FUTURE_DECAY ** np.arange(FUTURE_FRAMES + 1)
+        for f in range(N):
+            end = min(N, f + FUTURE_FRAMES + 1)
+            w   = future_weights[:end - f]
+            future_avg = float(np.average(raw_targets[f:end], weights=w))
+            gs = game_states[f]
+            future_ratio = 0.55 if gs in ("IDLE", "LOFT") else 0.30
+            planned[f] = raw_targets[f] * (1 - future_ratio) + future_avg * future_ratio
 
-                t_retain = T_RALLY
+        # ── D. Bidirectional Gaussian smoothing ───────────────────
+        # Blend two smoothing levels: heavy for idle, light for rally.
+        smooth_rally = self._gauss_smooth(planned, SIGMA_RALLY)
+        smooth_idle  = self._gauss_smooth(planned, SIGMA_IDLE)
+        idle_blend   = np.array([0.8 if gs in ("IDLE", "LOFT") else 0.15 for gs in game_states])
+        smoothed     = smooth_idle * idle_blend + smooth_rally * (1.0 - idle_blend)
 
-            # ── 5b. Player-midpoint bias — always drift toward player_midpoint ──
-            # Replaces old W/2 center bias: camera naturally rests where the players are,
-            # not at the geometric center of the original frame.
-            raw_target = raw_target * (1.0 - CENTER_BIAS) + player_midpoint * CENTER_BIAS
+        # ── E. Spring-damper simulation on planned path ───────────
+        # Now that the path is globally smooth, the spring just adds
+        # physical inertia. Genuine fast transitions get SPRING_SPRINT.
+        cam_pos = float(W / 2)
+        cam_vel = 0.0
+        cam_path = np.zeros(N)
+        prev_vel_sign  = 0
+        reversal_score = 0.0
+        fast_window    = int(fps * 0.30)
 
-            # ── 5c. Smooth the target (low-pass filter) ────────────
-            # The spring never sees raw target jumps — only the smoothed version.
-            # This is the primary fix for jitter and hard transitions.
-            target_smooth = target_smooth * t_retain + raw_target * (1.0 - t_retain)
+        for f in range(N):
+            target = smoothed[f]
+            gs     = game_states[f]
 
-            # ── 5d. Transition rate limiter ────────────────────────
-            # If the camera has been reversing direction frequently, penalise
-            # spring_k so it commits to one direction instead of oscillating.
+            # Detect genuine fast transition: path moves significantly in next 0.3 s
+            end_f   = min(N - 1, f + fast_window)
+            upcoming_move = abs(smoothed[end_f] - smoothed[f])
+            if upcoming_move > FAST_PAN_THRESH:
+                sk = SPRING_SPRINT
+            elif gs == "RALLY":
+                gap = abs(target - cam_pos) / W
+                sk  = SPRING_SPRINT if gap > 0.20 else (SPRING_RALLY * 1.2 if gap > 0.10 else SPRING_RALLY)
+            else:
+                sk = SPRING_IDLE
+
             reversal_score *= REVERSAL_DECAY
             if cam_vel != 0:
-                new_sign = 1 if cam_vel > 0 else -1
-                if prev_vel_sign != 0 and new_sign != prev_vel_sign:
+                ns = 1 if cam_vel > 0 else -1
+                if prev_vel_sign != 0 and ns != prev_vel_sign:
                     reversal_score += 1.0
-                prev_vel_sign = new_sign
+                prev_vel_sign = ns
             if reversal_score > REVERSAL_PENALISE:
-                spring_k *= REVERSAL_FACTOR
+                sk *= REVERSAL_FACTOR
 
-            # ── 6. Spring-damper camera update ────────────────────
-            cam_vel += spring_k * (target_smooth - cam_pos)
+            cam_vel += sk * (target - cam_pos)
             cam_vel *= DAMPING
-            max_step = crop_w * MAX_STEP_FRAC
-            cam_vel  = float(np.clip(cam_vel, -max_step, max_step))
+            cam_vel  = float(np.clip(cam_vel, -crop_w * MAX_STEP_FRAC, crop_w * MAX_STEP_FRAC))
             cam_pos += cam_vel
 
-            # ── 6b. Hard player-visibility clamp ──────────────────
-            # After all smoothing, guarantee outermost players are inside the crop.
-            # Only applied when players actually fit within crop_w.
-            if player_span <= crop_w - 2 * PLAYER_MARGIN:
-                cam_min = stable_p_right - crop_w / 2 + PLAYER_MARGIN
-                cam_max = stable_p_left  + crop_w / 2 - PLAYER_MARGIN
-                if cam_min <= cam_max:  # sanity check
+            # Hard player-visibility clamp
+            pl, pr = player_bounds[f]
+            p_span = pr - pl
+            if p_span <= crop_w - 2 * PLAYER_MARGIN:
+                cam_min = pr - crop_w / 2 + PLAYER_MARGIN
+                cam_max = pl + crop_w / 2 - PLAYER_MARGIN
+                if cam_min <= cam_max:
                     cam_pos = float(np.clip(cam_pos, cam_min, cam_max))
 
-            # ── 7. Clamp and crop ──────────────────────────────────
-            x1 = int(max(0, min(W - crop_w, cam_pos - crop_w / 2)))
-            writer.write(frame[0:H, x1:x1 + crop_w])
-            frame_idx += 1
+            cam_path[f] = cam_pos
 
-            if progress_callback and frame_idx % 30 == 0:
-                pct = min(99, int(frame_idx / total_frames * 100))
-                progress_callback(pct, frame_idx, total_frames)
+        log.info("Path planning done")
+
+        # ══════════════════════════════════════════════════════════
+        #  PASS 2 — Render
+        # ══════════════════════════════════════════════════════════
+
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            log.error("Cannot reopen video for rendering")
+            return None
+
+        temp_path = output_path + ".tmp.mp4"
+        fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
+        writer    = cv2.VideoWriter(temp_path, fourcc, fps, (crop_w, H))
+        if not writer.isOpened():
+            log.error("Cannot create VideoWriter")
+            cap.release()
+            return None
+
+        for f in range(N):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            x1 = int(max(0, min(W - crop_w, cam_path[f] - crop_w / 2)))
+            writer.write(frame[0:H, x1:x1 + crop_w])
+
+            if progress_callback and f % 30 == 0:
+                pct = 50 + min(49, int(f / N * 50))
+                progress_callback(pct, f, N)
 
         cap.release()
         writer.release()
 
         elapsed = time.time() - start_time
-        processing_fps = frame_idx / elapsed if elapsed > 0 else 0
+        processing_fps = N / elapsed if elapsed > 0 else 0
+        log.info("Reframe done: %d frames in %.1fs (%.1f fps)", N, elapsed, processing_fps)
 
-        log.info("Reframe done: %d frames in %.1fs (%.1f fps)",
-                 frame_idx, elapsed, processing_fps)
-
-        # Transcode to H.264
         try:
             transcode_h264(temp_path, output_path)
             os.remove(temp_path)
@@ -490,8 +494,8 @@ class PadelReframer:
                 os.rename(temp_path, output_path)
 
         return {
-            "frames": frame_idx,
-            "duration": round(frame_idx / fps, 1),
+            "frames": N,
+            "duration": round(N / fps, 1),
             "processing_time": round(elapsed, 1),
             "processing_fps": round(processing_fps, 1),
             "output_resolution": f"{crop_w}x{H}"
