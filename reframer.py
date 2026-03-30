@@ -159,64 +159,88 @@ class PadelReframer:
         # ══════════════════════════════════════════════════════════
 
         # Detection
-        BALL_CONF_FLOOR = 0.30      # ignore ball detections below this confidence
+        BALL_CONF_FLOOR  = 0.30     # ignore ball detections below this confidence
+        MAX_BALL_JUMP    = W * 0.18 # max believable ball jump per frame (outlier rejection)
 
         # Gravity weights (RALLY state)
-        BALL_WEIGHT_BASE = 2.5      # ball pulls 2.5× more than one player
+        BALL_WEIGHT_BASE = 2.5
         PLAYER_WEIGHT    = 1.0
 
-        # Spring-damper camera:
-        #   cam_vel += spring_k * (target - cam_pos)
-        #   cam_vel *= damping
+        # Center bias — always pull target toward W/2 by this fraction.
+        # Prevents camera from drifting into glass/walls between points.
+        CENTER_BIAS = 0.22
+
+        # Spring-damper camera (deliberately soft — smoothness > speed):
+        #   cam_vel += spring_k * (target_smooth - cam_pos)
+        #   cam_vel *= DAMPING
         #   cam_pos += cam_vel
-        # Higher spring_k = faster response. Damping < 1 = friction.
-        SPRING_RALLY   = 0.20       # responsive during a rally
-        SPRING_IDLE    = 0.07       # gentle between points / loft
-        SPRING_SPRINT  = 0.38       # camera way behind — race to catch up
-        DAMPING        = 0.72       # velocity retention per frame (lower = stops faster)
-        MAX_STEP_FRAC  = 0.10       # hard cap: camera moves ≤10% of crop_w per frame
+        SPRING_RALLY  = 0.11        # rally tracking
+        SPRING_IDLE   = 0.05        # between points / loft / recovery
+        SPRING_SPRINT = 0.20        # camera significantly behind (was 0.38 — reduced to kill lurches)
+        DAMPING       = 0.82        # higher = smoother stop (was 0.72)
+        MAX_STEP_FRAC = 0.055       # hard cap per frame — 5.5% of crop_w (was 10%)
+
+        # Target smoothing — the target itself is low-pass filtered before the spring
+        # sees it. This is the main fix for jitter: even a sudden ball jump creates
+        # a gradual target shift, so the camera can't lunge.
+        # T_* = retention per frame (higher = slower target movement)
+        T_RALLY    = 0.80           # target updates at moderate pace during rally
+        T_IDLE     = 0.94           # target barely moves between points
+        T_LOFT     = 0.92           # hold steady during ball arc
+        T_RECOVERY = 0.90           # gentle fade back to players
+
+        # Transition rate limiter — track direction reversals; if too many in a short
+        # window, penalise spring_k so the camera commits to one direction.
+        REVERSAL_DECAY    = 0.92    # reversal score decays each frame
+        REVERSAL_PENALISE = 3.0     # score above this → apply penalty
+        REVERSAL_FACTOR   = 0.40    # spring_k multiplied by this when oscillating
 
         # Predictive lookahead (RALLY state only)
-        # Scales from LOOKAHEAD_MIN at slow speed to LOOKAHEAD_MAX at SPEED_FAST
-        LOOKAHEAD_MIN = 4           # frames ahead at slow pace
-        LOOKAHEAD_MAX = 14          # frames ahead at fast rally speed
-        SPEED_FAST    = W * 0.040   # px/frame — ball crossing 4% of frame width
+        LOOKAHEAD_MIN = 3
+        LOOKAHEAD_MAX = 10          # reduced from 14 — less overshoot
+        SPEED_FAST    = W * 0.040
 
         # Ball velocity smoothing
-        VX_SMOOTH = 0.40            # how fast directional velocity adapts
-        VY_SMOOTH = 0.40
+        VX_SMOOTH = 0.30            # slower adaptation → less reaction to single-frame noise
+        VY_SMOOTH = 0.35
 
         # Ball physics prediction (RECOVERY state)
-        PRED_VX_DECAY  = 0.88       # horizontal speed decays each predicted frame
-        PRED_VY_DECAY  = 0.95       # vertical speed decays slightly less (gravity)
-        GRAVITY        = 0.6        # px/frame² downward acceleration approximation
-        BALL_LOST_MAX  = 22         # frames of physics prediction before giving up
+        PRED_VX_DECAY = 0.88
+        PRED_VY_DECAY = 0.95
+        GRAVITY       = 0.6
+        BALL_LOST_MAX = 35          # longer prediction window before giving up (was 22)
 
-        # LOFT detection: ball moving upward faster than this threshold
-        LOFT_VY_THRESH = -(H * 0.010)   # px/frame (negative = going up)
+        # LOFT detection
+        LOFT_VY_THRESH = -(H * 0.010)
 
-        # Y-position ball weight: reduce pull when ball is near top of frame (mid-arc)
-        LOFT_Y_TOP   = 0.15         # above this → weight 0.3 (barely tracking)
-        LOFT_Y_TRANS = 0.28         # transition zone bottom
+        # Y-position ball weight
+        LOFT_Y_TOP   = 0.15
+        LOFT_Y_TRANS = 0.28
 
-        # Edge-proximity: if ball is this close to crop edge → force SPRING_SPRINT
-        EDGE_MARGIN_FRAC = 0.16
+        # Edge-proximity boost (gentle — no more SPRINT lurch)
+        EDGE_MARGIN_FRAC  = 0.14
+        EDGE_SPRING_BOOST = 1.6     # multiply spring_k (not replace with SPRINT)
 
         # ══════════════════════════════════════════════════════════
         #  STATE
         # ══════════════════════════════════════════════════════════
 
-        cam_pos = float(W / 2)      # camera position = center-X of crop window
-        cam_vel = 0.0               # camera velocity (px/frame)
+        cam_pos      = float(W / 2)
+        cam_vel      = 0.0
+        target_smooth = float(W / 2)   # smoothed target — what the spring actually chases
 
-        # Ball state estimator — maintained whether ball is detected or predicted
-        est_x  = None               # estimated ball X (detected or physics)
-        est_y  = None               # estimated ball Y
-        est_vx = 0.0                # ball horizontal velocity, signed (px/frame)
-        est_vy = 0.0                # ball vertical velocity (negative = going up)
-        ball_lost_frames = 0        # consecutive frames without a detection
+        # Ball state estimator
+        est_x  = None
+        est_y  = None
+        est_vx = 0.0
+        est_vy = 0.0
+        ball_lost_frames = 0
 
         last_player_centroid = float(W / 2)
+
+        # Reversal tracker
+        prev_vel_sign  = 0
+        reversal_score = 0.0
 
         # ══════════════════════════════════════════════════════════
         #  VIDEO WRITER
@@ -282,12 +306,22 @@ class PadelReframer:
 
             # ── 3. Ball state estimator ────────────────────────────
             if det_ball_x is not None:
-                # Ball detected — update velocity and reset lost counter
                 if est_x is not None:
+                    # Outlier rejection: if detection is far from predicted position,
+                    # it's likely a false positive or tracking glitch — partially trust it.
+                    predicted_x = est_x + est_vx
+                    predicted_y = est_y + est_vy
+                    jump = abs(det_ball_x - predicted_x)
+                    if jump > MAX_BALL_JUMP:
+                        trust = max(0.25, 1.0 - (jump - MAX_BALL_JUMP) / (W * 0.30))
+                        det_ball_x = predicted_x * (1 - trust) + det_ball_x * trust
+                        det_ball_y = predicted_y * (1 - trust) + det_ball_y * trust
+
                     raw_vx = det_ball_x - est_x
                     raw_vy = det_ball_y - est_y
                     est_vx = est_vx * (1 - VX_SMOOTH) + raw_vx * VX_SMOOTH
                     est_vy = est_vy * (1 - VY_SMOOTH) + raw_vy * VY_SMOOTH
+
                 est_x = det_ball_x
                 est_y = det_ball_y
                 ball_lost_frames = 0
@@ -298,8 +332,7 @@ class PadelReframer:
                     est_x  += est_vx
                     est_y  += est_vy
                     est_vx *= PRED_VX_DECAY
-                    est_vy  = est_vy * PRED_VY_DECAY + GRAVITY  # gravity pulls down
-                    # Give up if prediction exits the frame
+                    est_vy  = est_vy * PRED_VY_DECAY + GRAVITY
                     if est_x < 0 or est_x > W or est_y < 0 or est_y > H * 1.15:
                         est_x = None
                 elif ball_lost_frames > BALL_LOST_MAX:
@@ -318,34 +351,31 @@ class PadelReframer:
             else:
                 game_state = "RALLY"
 
-            # ── 5. Compute target_x and spring_k per state ─────────
+            # ── 5. Compute raw target and spring_k per state ───────
             if game_state == "IDLE":
-                target_x = last_player_centroid
-                spring_k  = SPRING_IDLE
+                raw_target = last_player_centroid
+                spring_k   = SPRING_IDLE
+                t_retain   = T_IDLE
 
             elif game_state == "LOFT":
-                # Ball is mid-arc — camera holds on players.
-                # Blend in a tiny bit of ball X so the camera doesn't completely
-                # ignore lateral movement during a loft.
                 if player_xs:
-                    target_x = last_player_centroid * 0.88 + est_x * 0.12
+                    raw_target = last_player_centroid * 0.88 + est_x * 0.12
                 else:
-                    target_x = est_x
+                    raw_target = est_x
                 spring_k = SPRING_IDLE
+                t_retain = T_LOFT
 
             elif game_state == "RECOVERY":
-                # Physics prediction active — fade ball influence to zero as it ages
-                fade     = 1.0 - (ball_lost_frames / BALL_LOST_MAX)
-                target_x = est_x * fade + last_player_centroid * (1.0 - fade)
-                spring_k = SPRING_IDLE
+                fade       = 1.0 - (ball_lost_frames / BALL_LOST_MAX)
+                raw_target = est_x * fade + last_player_centroid * (1.0 - fade)
+                spring_k   = SPRING_IDLE
+                t_retain   = T_RECOVERY
 
             else:  # RALLY
-                # ── Predictive lookahead ──
                 speed_abs = abs(est_vx)
                 lookahead = LOOKAHEAD_MIN + (LOOKAHEAD_MAX - LOOKAHEAD_MIN) * min(1.0, speed_abs / SPEED_FAST)
                 pred_x    = float(np.clip(est_x + est_vx * lookahead, 0, W))
 
-                # ── Y-aware ball weight (near top = mid-arc = reduce pull) ──
                 if est_y < H * LOFT_Y_TOP:
                     eff_ball_w = 0.3
                 elif est_y < H * LOFT_Y_TRANS:
@@ -354,30 +384,50 @@ class PadelReframer:
                 else:
                     eff_ball_w = BALL_WEIGHT_BASE
 
-                # ── Gravity core: predicted ball + players ──
                 pts = [pred_x] + player_xs
                 wts = [eff_ball_w] + [PLAYER_WEIGHT] * len(player_xs)
-                target_x = float(np.average(pts, weights=wts))
+                raw_target = float(np.average(pts, weights=wts))
 
-                # ── Spring stiffness scales with distance gap ──
-                gap_frac = abs(target_x - cam_pos) / W
+                gap_frac = abs(raw_target - cam_pos) / W
                 if gap_frac > 0.25:
                     spring_k = SPRING_SPRINT
                 elif gap_frac > 0.10:
-                    spring_k = SPRING_RALLY * 1.25
+                    spring_k = SPRING_RALLY * 1.20
                 else:
                     spring_k = SPRING_RALLY
 
-                # ── Edge-proximity safety net ──
-                # If ball is already near the crop edge, force sprint regardless
+                # Edge-proximity: boost spring gently (not replace with sprint)
                 crop_left    = cam_pos - crop_w / 2
                 ball_in_crop = est_x - crop_left
                 edge_margin  = crop_w * EDGE_MARGIN_FRAC
                 if ball_in_crop < edge_margin or ball_in_crop > (crop_w - edge_margin):
-                    spring_k = SPRING_SPRINT
+                    spring_k = min(SPRING_SPRINT, spring_k * EDGE_SPRING_BOOST)
+
+                t_retain = T_RALLY
+
+            # ── 5b. Center bias — always pull raw target toward W/2 ──
+            # This keeps the camera away from glass/walls unless action forces it out.
+            raw_target = raw_target * (1.0 - CENTER_BIAS) + (W / 2.0) * CENTER_BIAS
+
+            # ── 5c. Smooth the target (low-pass filter) ────────────
+            # The spring never sees raw target jumps — only the smoothed version.
+            # This is the primary fix for jitter and hard transitions.
+            target_smooth = target_smooth * t_retain + raw_target * (1.0 - t_retain)
+
+            # ── 5d. Transition rate limiter ────────────────────────
+            # If the camera has been reversing direction frequently, penalise
+            # spring_k so it commits to one direction instead of oscillating.
+            reversal_score *= REVERSAL_DECAY
+            if cam_vel != 0:
+                new_sign = 1 if cam_vel > 0 else -1
+                if prev_vel_sign != 0 and new_sign != prev_vel_sign:
+                    reversal_score += 1.0
+                prev_vel_sign = new_sign
+            if reversal_score > REVERSAL_PENALISE:
+                spring_k *= REVERSAL_FACTOR
 
             # ── 6. Spring-damper camera update ────────────────────
-            cam_vel += spring_k * (target_x - cam_pos)
+            cam_vel += spring_k * (target_smooth - cam_pos)
             cam_vel *= DAMPING
             max_step = crop_w * MAX_STEP_FRAC
             cam_vel  = float(np.clip(cam_vel, -max_step, max_step))
